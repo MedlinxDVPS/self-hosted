@@ -22,7 +22,7 @@ SENTRY_CONFIG_PY = "sentry/sentry.conf.py"
 SENTRY_TEST_HOST = os.getenv("SENTRY_TEST_HOST", "http://localhost:9000")
 TEST_USER = "test@example.com"
 TEST_PASS = "test123TEST"
-TIMEOUT_SECONDS = 60
+TIMEOUT_SECONDS = int(os.getenv("SENTRY_TEST_TIMEOUT", "60"))
 
 
 def poll_for_response(
@@ -126,11 +126,68 @@ def test_receive_event(client_login):
 
     sentry_sdk.init(dsn=get_sentry_dsn(client))
 
+    # Send the event and capture the event ID
     event_id = sentry_sdk.capture_exception(Exception("a failure"))
     assert event_id is not None
-    response = poll_for_response(
-        f"{SENTRY_TEST_HOST}/api/0/projects/sentry/internal/events/{event_id}/", client
-    )
+    print(f"Event captured with ID: {event_id}")
+    
+    # Add a small initial delay to allow for basic processing
+    time.sleep(2)
+    
+    # Try polling with enhanced debugging
+    api_url = f"{SENTRY_TEST_HOST}/api/0/projects/sentry/internal/events/{event_id}/"
+    print(f"Polling for event at: {api_url}")
+    
+    last_status_code = None
+    last_response_text = ""
+    
+    for attempt in range(TIMEOUT_SECONDS):
+        try:
+            response = client.get(
+                api_url, 
+                follow_redirects=True, 
+                headers={"Referer": SENTRY_TEST_HOST}
+            )
+            last_status_code = response.status_code
+            last_response_text = response.text[:500]  # First 500 chars for debugging
+            
+            if response.status_code == 200:
+                print(f"Event found after {attempt} seconds")
+                break
+            elif response.status_code in [404, 403]:
+                # Expected status codes while event is being processed
+                pass
+            else:
+                print(f"Unexpected status code {response.status_code} at attempt {attempt}")
+            
+            # Log progress every 10 seconds
+            if attempt % 10 == 0 and attempt > 0:
+                print(f"Still waiting for event after {attempt} seconds (status: {response.status_code})")
+                
+        except Exception as e:
+            print(f"Request failed at attempt {attempt}: {e}")
+            
+        time.sleep(1)
+    else:
+        # Enhanced error message with debugging info
+        error_msg = f"""
+Event processing timeout after {TIMEOUT_SECONDS} seconds.
+Event ID: {event_id}
+API URL: {api_url}
+Last status code: {last_status_code}
+Last response: {last_response_text}
+
+This suggests that the event was sent successfully but the processing pipeline 
+(relay -> kafka -> events-consumer -> snuba) may be delayed or has issues.
+Check the logs of the following services:
+- events-consumer
+- worker  
+- snuba-errors-consumer
+- relay
+"""
+        raise AssertionError(error_msg.strip())
+    
+    # Validate the response
     response_json = json.loads(response.text)
     assert response_json["eventID"] == event_id
     assert response_json["metadata"]["value"] == "a failure"
